@@ -11,6 +11,15 @@ Decoding (MVPA)
 
 .. include:: ../../links.inc
 
+In this tutorial you will learn how to:
+
+- Build a decoding pipeline using scikit-learn estimators with MNE
+- Apply transformation classes (Scaler, Vectorizer) to prepare EEG/MEG data
+- Use spatial filters (CSP) for feature extraction
+- Decode brain activity over time using :class:`~mne.decoding.SlidingEstimator`
+- Generalize a decoder across time using :class:`~mne.decoding.GeneralizingEstimator`
+- Project sensor-space patterns back to source space
+
 Design philosophy
 =================
 Decoding (a.k.a. MVPA) in MNE largely follows the machine learning API of the
@@ -96,45 +105,26 @@ y = epochs.events[:, 2]  # target: auditory left vs visual left
 #
 # Scaler
 # ^^^^^^
-# The :class:`mne.decoding.Scaler` will standardize the data based on channel
-# scales. In the simplest modes ``scalings=None`` or ``scalings=dict(...)``,
-# each data channel type (e.g., mag, grad, eeg) is treated separately and
-# scaled by a constant. This is the approach used by e.g.,
+# :class:`mne.decoding.Scaler` standardizes the data based on channel scales.
+# In the simplest modes ``scalings=None`` or ``scalings=dict(...)``, each data
+# channel type (e.g., mag, grad, eeg) is treated separately and scaled by a
+# constant. This is the approach used by e.g.,
 # :func:`mne.compute_covariance` to standardize channel scales.
 #
-# If ``scalings='mean'`` or ``scalings='median'``, each channel is scaled using
-# empirical measures. Each channel is scaled independently by the mean and
-# standand deviation, or median and interquartile range, respectively, across
-# all epochs and time points during :class:`~mne.decoding.Scaler.fit`
-# (during training). The :meth:`~mne.decoding.Scaler.transform` method is
-# called to transform data (training or test set) by scaling all time points
-# and epochs on a channel-by-channel basis. To perform both the ``fit`` and
-# ``transform`` operations in a single call, the
-# :meth:`~mne.decoding.Scaler.fit_transform` method may be used. To invert the
-# transform, :meth:`~mne.decoding.Scaler.inverse_transform` can be used. For
-# ``scalings='median'``, scikit-learn_ version 0.17+ is required.
-#
-# .. note:: Using this class is different from directly applying
-#           :class:`sklearn.preprocessing.StandardScaler` or
-#           :class:`sklearn.preprocessing.RobustScaler` offered by
-#           scikit-learn_. These scale each *classification feature*, e.g.
-#           each time point for each channel, with mean and standard
-#           deviation computed across epochs, whereas
-#           :class:`mne.decoding.Scaler` scales each *channel* using mean and
-#           standard deviation computed across all of its time points
-#           and epochs.
+# If ``scalings='mean'`` or ``scalings='median'``, each channel is scaled
+# using empirical measures across all epochs and time points during
+# :meth:`~mne.decoding.Scaler.fit`. The key distinction from
+# :class:`sklearn.preprocessing.StandardScaler` is that MNE's
+# :class:`~mne.decoding.Scaler` scales each *channel* (across time and
+# epochs), whereas scikit-learn's version scales each *feature* (e.g., each
+# time point) across epochs.
 #
 # Vectorizer
 # ^^^^^^^^^^
-# Scikit-learn API provides functionality to chain transformers and estimators
-# by using :class:`sklearn.pipeline.Pipeline`. We can construct decoding
-# pipelines and perform cross-validation and grid-search. However scikit-learn
-# transformers and estimators generally expect 2D data
-# (n_samples * n_features), whereas MNE transformers typically output data
-# with a higher dimensionality
-# (e.g. n_samples * n_channels * n_frequencies * n_times). A Vectorizer
-# therefore needs to be applied between the MNE and the scikit-learn steps
-# like:
+# Scikit-learn estimators generally expect 2D data (n_samples × n_features),
+# whereas MNE transformers output higher-dimensional arrays
+# (e.g. n_samples × n_channels × n_times). :class:`mne.decoding.Vectorizer`
+# bridges this gap and must be inserted between MNE and scikit-learn steps:
 
 # Uses all MEG sensors and time points as separate classification
 # features, so the resulting filters used are spatio-temporal
@@ -151,76 +141,57 @@ score = np.mean(scores, axis=0)
 print(f"Spatio-temporal: {100 * score:0.1f}%")
 
 # %%
-# PSDEstimator
-# ^^^^^^^^^^^^
-# The :class:`mne.decoding.PSDEstimator`
-# computes the power spectral density (PSD) using the multitaper
-# method. It takes a 3D array as input, converts it into 2D and computes the
-# PSD.
-#
-# FilterEstimator
-# ^^^^^^^^^^^^^^^
-# The :class:`mne.decoding.FilterEstimator` filters the 3D epochs data.
+# Other transformation classes
+# ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+# :class:`mne.decoding.PSDEstimator` computes the power spectral density (PSD)
+# using the multitaper method, converting a 3D input into 2D.
+# :class:`mne.decoding.FilterEstimator` filters the 3D epochs data in place
+# within a pipeline. See their API pages for usage details.
 #
 # Spatial filters
 # ===============
 #
-# Just like temporal filters, spatial filters provide weights to modify the
-# data along the sensor dimension. They are popular in the BCI community
-# because of their simplicity and ability to distinguish spatially-separated
-# neural activity.
+# Spatial filters provide weights to modify the data along the sensor
+# dimension. They are popular in the BCI community because of their simplicity
+# and ability to distinguish spatially-separated neural activity.
 #
 # Common spatial pattern
 # ^^^^^^^^^^^^^^^^^^^^^^
 #
-# :class:`mne.decoding.CSP` is a technique to analyze multichannel data based
-# on recordings from two classes :footcite:`Koles1991` (see also
+# :class:`mne.decoding.CSP` analyzes multichannel data from two classes
+# :footcite:`Koles1991` (see also
 # https://en.wikipedia.org/wiki/Common_spatial_pattern).
+# CSP finds spatial filters that maximize variance for one class while
+# minimizing it for the other, making it effective for motor imagery and
+# other paradigms with distinct spatial distributions.
 #
-# Let :math:`X \in R^{C\times T}` be a segment of data with
-# :math:`C` channels and :math:`T` time points. The data at a single time point
-# is denoted by :math:`x(t)` such that :math:`X=[x(t), x(t+1), ..., x(t+T-1)]`.
-# Common spatial pattern (CSP) finds a decomposition that projects the signal
-# in the original sensor space to CSP space using the following transformation:
+# .. admonition:: Mathematical background
+#    :class: dropdown note
 #
-# .. math::       x_{CSP}(t) = W^{T}x(t)
-#    :name: csp
+#    Let :math:`X \in R^{C\times T}` be a segment of data with :math:`C`
+#    channels and :math:`T` time points. CSP finds a decomposition that
+#    projects the signal in the original sensor space using:
 #
-# where each column of :math:`W \in R^{C\times C}` is a spatial filter and each
-# row of :math:`x_{CSP}` is a CSP component. The matrix :math:`W` is also
-# called the de-mixing matrix in other contexts. Let
-# :math:`\Sigma^{+} \in R^{C\times C}` and :math:`\Sigma^{-} \in R^{C\times C}`
-# be the estimates of the covariance matrices of the two conditions.
-# CSP analysis is given by the simultaneous diagonalization of the two
-# covariance matrices
+#    .. math::       x_{CSP}(t) = W^{T}x(t)
+#       :name: csp
 #
-# .. math::       W^{T}\Sigma^{+}W = \lambda^{+}
-#    :name: diagonalize_p
-# .. math::       W^{T}\Sigma^{-}W = \lambda^{-}
-#    :name: diagonalize_n
+#    where each column of :math:`W \in R^{C\times C}` is a spatial filter.
+#    Let :math:`\Sigma^{+}` and :math:`\Sigma^{-}` be the covariance matrices
+#    of the two conditions. CSP finds :math:`W` via simultaneous
+#    diagonalization:
 #
-# where :math:`\lambda^{C}` is a diagonal matrix whose entries are the
-# eigenvalues of the following generalized eigenvalue problem
+#    .. math::       W^{T}\Sigma^{+}W = \lambda^{+}
+#    .. math::       W^{T}\Sigma^{-}W = \lambda^{-}
 #
-# .. math::      \Sigma^{+}w = \lambda \Sigma^{-}w
-#    :name: eigen_problem
-#
-# Large entries in the diagonal matrix corresponds to a spatial filter which
-# gives high variance in one class but low variance in the other. Thus, the
-# filter facilitates discrimination between the two classes.
+#    which corresponds to the generalized eigenvalue problem
+#    :math:`\Sigma^{+}w = \lambda \Sigma^{-}w`. Filters with large eigenvalues
+#    give high variance in one class but low variance in the other, facilitating
+#    discrimination.
 #
 # .. topic:: Examples
 #
 #     * :ref:`ex-decoding-csp-eeg`
 #     * :ref:`ex-decoding-csp-eeg-timefreq`
-#
-# .. note::
-#
-#     The winning entry of the Grasp-and-lift EEG competition in Kaggle used
-#     the :class:`~mne.decoding.CSP` implementation in MNE and was featured as
-#     a `script of the week <sotw_>`_.
-#
-# .. _sotw: http://blog.kaggle.com/2015/08/12/july-2015-scripts-of-the-week/
 #
 # We can use CSP with these data with:
 
@@ -233,13 +204,10 @@ print(f"CSP: {100 * scores.mean():0.1f}%")
 # Source power comodulation (SPoC)
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 # Source Power Comodulation (:class:`mne.decoding.SPoC`)
-# :footcite:`DahneEtAl2014` identifies the composition of
-# orthogonal spatial filters that maximally correlate with a continuous target.
-#
-# SPoC can be seen as an extension of the CSP where the target is driven by a
-# continuous variable rather than a discrete variable. Typical applications
-# include extraction of motor patterns using EMG power or audio patterns using
-# sound envelope.
+# :footcite:`DahneEtAl2014` identifies spatial filters that maximally correlate
+# with a continuous target variable. It can be seen as an extension of CSP for
+# continuous (rather than discrete) targets, with typical applications in motor
+# pattern extraction using EMG power or audio patterns using sound envelope.
 #
 # .. topic:: Examples
 #
@@ -247,12 +215,9 @@ print(f"CSP: {100 * scores.mean():0.1f}%")
 #
 # xDAWN
 # ^^^^^
-# :class:`mne.preprocessing.Xdawn` is a spatial filtering method designed to
-# improve the signal to signal + noise ratio (SSNR) of the ERP responses
-# :footcite:`RivetEtAl2009`. Xdawn was originally
-# designed for P300 evoked potential by enhancing the target response with
-# respect to the non-target response. The implementation in MNE-Python is a
-# generalization to any type of ERP.
+# :class:`mne.preprocessing.Xdawn` improves the signal-to-noise ratio of ERP
+# responses :footcite:`RivetEtAl2009`. Originally designed for P300 evoked
+# potentials, the MNE-Python implementation generalizes to any ERP type.
 #
 # .. topic:: Examples
 #
@@ -261,10 +226,10 @@ print(f"CSP: {100 * scores.mean():0.1f}%")
 #
 # Effect-matched spatial filtering
 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-# The result of :class:`mne.decoding.EMS` is a spatial filter at each time
-# point and a corresponding time course :footcite:`SchurgerEtAl2013`.
-# Intuitively, the result gives the similarity between the filter at
-# each time point and the data vector (sensors) at that time point.
+# :class:`mne.decoding.EMS` produces a spatial filter at each time point and a
+# corresponding time course :footcite:`SchurgerEtAl2013`. The result gives the
+# similarity between the filter at each time point and the data vector at that
+# time point.
 #
 # .. topic:: Examples
 #
@@ -273,17 +238,23 @@ print(f"CSP: {100 * scores.mean():0.1f}%")
 # Patterns vs. filters
 # ^^^^^^^^^^^^^^^^^^^^
 #
-# When interpreting the components of the CSP (or spatial filters in general),
-# it is often more intuitive to think about how :math:`x(t)` is composed of
-# the different CSP components :math:`x_{CSP}(t)`. In other words, we can
-# rewrite Equation :eq:`csp` as follows:
+# When interpreting spatial filter components, it is often more intuitive to
+# think in terms of *patterns* (how the signal is composed) rather than
+# *filters* (how the signal is projected). For a filter matrix :math:`W`, the
+# corresponding spatial patterns are the columns of :math:`(W^{-1})^T`, also
+# called the mixing matrix.
 #
-# .. math::       x(t) = (W^{-1})^{T}x_{CSP}(t)
-#    :name: patterns
+# .. admonition:: Mathematical background
+#    :class: dropdown note
 #
-# The columns of the matrix :math:`(W^{-1})^T` are called spatial patterns.
-# This is also called the mixing matrix. The example :ref:`ex-linear-patterns`
-# discusses the difference between patterns and filters.
+#    Rewriting Equation :eq:`csp`:
+#
+#    .. math::       x(t) = (W^{-1})^{T}x_{CSP}(t)
+#       :name: patterns
+#
+#    The columns of :math:`(W^{-1})^T` are the spatial patterns (mixing
+#    matrix). See :ref:`ex-linear-patterns` for a detailed discussion of why
+#    patterns are neurophysiologically more interpretable than filters.
 #
 # These can be plotted for every spatial filter including CSP, XdawnTransformer,
 # SSD and SPoC:
@@ -300,27 +271,22 @@ spf.plot_filters(components=[0, 1, 2], scalings=1e-9)
 # Decoding over time
 # ==================
 #
-# This strategy consists in fitting a multivariate predictive model on each
-# time instant and evaluating its performance at the same instant on new
-# epochs. The :class:`mne.decoding.SlidingEstimator` will take as input a
-# pair of features :math:`X` and targets :math:`y`, where :math:`X` has
-# more than 2 dimensions. For decoding over time the data :math:`X`
-# is the epochs data of shape n_epochs × n_channels × n_times. As the
-# last dimension of :math:`X` is the time, an estimator will be fit
-# on every time instant.
+# This strategy fits a multivariate predictive model on each time instant and
+# evaluates its performance at the same instant on new epochs.
+# :class:`mne.decoding.SlidingEstimator` accepts features :math:`X` and
+# targets :math:`y`, where :math:`X` has shape
+# (n_epochs × n_channels × n_times). An estimator is fit independently on
+# every time slice.
 #
-# This approach is analogous to SlidingEstimator-based approaches in fMRI,
-# where here we are interested in when one can discriminate experimental
-# conditions and therefore figure out when the effect of interest happens.
-#
-# When working with linear models as estimators, this approach boils
-# down to estimating a discriminative spatial filter for each time instant.
+# This approach tells us *when* one can discriminate experimental conditions,
+# and is analogous to SlidingEstimator-based approaches in fMRI.
+# When using linear models, this reduces to estimating a discriminative
+# spatial filter for each time instant.
 #
 # Temporal decoding
 # ^^^^^^^^^^^^^^^^^
 #
-# We'll use a Logistic Regression for a binary classification as machine
-# learning model.
+# We'll use Logistic Regression for binary classification:
 
 # We will train the classifier on all left visual vs auditory trials on MEG
 
@@ -363,24 +329,16 @@ evoked_time_gen.plot_joint(
 # Temporal generalization
 # ^^^^^^^^^^^^^^^^^^^^^^^
 #
-# Temporal generalization is an extension of the decoding over time approach.
-# It consists in evaluating whether the model estimated at a particular
-# time instant accurately predicts any other time instant. It is analogous to
-# transferring a trained model to a distinct learning problem, where the
-# problems correspond to decoding the patterns of brain activity recorded at
-# distinct time instants.
+# Temporal generalization extends decoding over time by evaluating whether a
+# model trained at one time instant can accurately predict *other* time
+# instants. This tests whether the neural code at a given moment transfers to
+# other moments — analogous to transferring a trained model to a distinct but
+# related problem.
 #
-# The object to for Temporal generalization is
-# :class:`mne.decoding.GeneralizingEstimator`. It expects as input :math:`X`
-# and :math:`y` (similarly to :class:`~mne.decoding.SlidingEstimator`) but
-# generates predictions from each model for all time instants. The class
-# :class:`~mne.decoding.GeneralizingEstimator` is generic and will treat the
-# last dimension as the one to be used for generalization testing. For
-# convenience, here, we refer to it as different tasks. If :math:`X`
-# corresponds to epochs data then the last dimension is time.
-#
-# This runs the analysis used in :footcite:`KingEtAl2014` and further detailed
-# in :footcite:`KingDehaene2014`:
+# :class:`mne.decoding.GeneralizingEstimator` generates predictions from each
+# time-trained model for all time instants, producing a training-time ×
+# testing-time score matrix. This analysis is described in
+# :footcite:`KingEtAl2014` and :footcite:`KingDehaene2014`:
 
 # define the Temporal generalization object
 time_gen = GeneralizingEstimator(clf, n_jobs=None, scoring="roc_auc", verbose=True)
@@ -461,6 +419,12 @@ brain = stc.plot(
 #
 #  - Explore other datasets from MNE (e.g. Face dataset from SPM to predict
 #    Face vs. Scrambled)
+#  - Try a different classifier (e.g. :class:`sklearn.svm.SVC`) and compare
+#    performance to Logistic Regression
+#  - Apply :class:`~mne.decoding.SlidingEstimator` to source-space data and
+#    compare the temporal dynamics to sensor-space decoding
+#  - Vary the number of CSP components and observe the effect on classification
+#    accuracy
 #
 # References
 # ==========
